@@ -177,6 +177,9 @@ public:
 protected:
     bool m_fDecodeToRenderSize;
     bool m_fDecodeToRenderSizeForcedOff;
+
+    // Set when SetSource disqualified DecodeToRenderSize only because the source was not live yet.
+    bool m_decodeToRenderSizeDisqualifiedByLiveness;
     uint32_t m_frameIndex = 0;
 
     _Check_return_ HRESULT OnImageAvailableCommon(

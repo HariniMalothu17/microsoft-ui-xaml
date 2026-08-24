@@ -169,6 +169,7 @@ CImageSource::CImageSource(_In_ CCoreServices *pCore)
     m_pAsyncAction          = nullptr;
     m_fDecodeToRenderSize   = FALSE;
     m_fDecodeToRenderSizeForcedOff = FALSE;
+    m_decodeToRenderSizeDisqualifiedByLiveness = false;
     m_pendingDecodeForLostSoftwareSurface = FALSE;
     m_downloadProgress = 0;
     m_nCreateOptions = DirectUI::BitmapCreateOptions::None;
@@ -729,6 +730,11 @@ CImageSource::SetSource(
     if (!IsActive())
     {
         TraceDecodeToRenderSizeDisqualified(ImageDecodeBoundsFinder::NotInLiveTree);
+
+        // Liveness is transient, so remember it was the only disqualifier and let EnterImpl re-qualify.
+        m_decodeToRenderSizeDisqualifiedByLiveness =
+            OfTypeByIndex<KnownTypeIndex::SvgImageSource>() && !m_fDecodeToRenderSizeForcedOff;
+
         m_fDecodeToRenderSizeForcedOff = TRUE;
     }
 
@@ -1981,6 +1987,14 @@ CImageSource::EnterImpl(_In_ CDependencyObject *pNamescopeOwner, _In_ EnterParam
     if (params.fIsLive)
     {
         UnregisterForCleanupOnEnter();
+
+        // No longer NotInLiveTree, so re-qualify; the render walk supplies the render size from here.
+        if (m_decodeToRenderSizeDisqualifiedByLiveness)
+        {
+            m_decodeToRenderSizeDisqualifiedByLiveness = false;
+            m_fDecodeToRenderSizeForcedOff = FALSE;
+            m_fDecodeToRenderSize = ShouldDecodeToRenderSize();
+        }
     }
 
     return S_OK;

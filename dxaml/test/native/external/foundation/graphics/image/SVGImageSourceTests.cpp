@@ -1484,4 +1484,97 @@ void SvgImageSourceTests::SvgWithoutDevice()
     u->VerifyMockDCompOutput(MockDComp::SurfaceComparison::ReferencedOnly);
 }
 
+// Regression test for AB#47128962: SetSourceAsync on a detached SvgImageSource used to latch
+// DecodeToRenderSize off permanently, leaving the SVG rasterized at the XamlRoot's size instead of
+// the element's render size. Sets the source before parenting, then verifies the render-size decode
+// still happens. Without the fix the DecodeToRenderSize codepath never runs and the waiter times out.
+void SvgImageSourceTests::SetSourceAsyncBeforeEnteringTreeDecodesToRenderSize()
+{
+    TestCleanupWrapper cleanup;
+
+    WUCRenderingScopeGuard guard(DCompRendering::WUCCompleteSynchronousCompTree);
+
+    const int imageElementWidth = 100;
+    const int imageElementHeight = 100;
+
+    // DecodeToRenderSize clamps to the element size; the buggy decode uses the root size and never raises this.
+    Platform::String^ etwValidationString =
+        L"@DecodeWidth=" + imageElementWidth + L" AND " +
+        L"@DecodeHeight=" + imageElementHeight;
+
+    ETWWaiterProxy imageEtwWaiter;
+    imageEtwWaiter.Start(
+        WINDOWS_UI_XAML_ETW_PROVIDER,
+        DecodeToRenderSizeBegin_value,
+        etwValidationString);
+
+    LOG_OUTPUT(L"Getting stream of svg image");
+    wsts::IRandomAccessStream^ svgStream = LoadBinaryFile(GetResourcesPath() + L"msft.svg");
+
+    auto rootGrid = safe_cast<Grid^>(LoadXamlFileOnUIThread(GetResourcesPath() + L"SimpleImage.xaml"));
+    VERIFY_IS_NOT_NULL(rootGrid);
+
+    SvgImageSource^ svgImageSource = nullptr;
+    xaml_controls::Image^ testImage = nullptr;
+    auto sourceAsyncCompletionEvent = std::make_shared<Event>();
+    SvgImageSourceLoadStatus status;
+
+    RunOnUIThread([&]()
+    {
+        TestServices::WindowHelper->WindowContent = rootGrid;
+
+        testImage = safe_cast<xaml_controls::Image^>(rootGrid->FindName(L"imageElement"));
+        VERIFY_IS_NOT_NULL(testImage);
+        testImage->Width = imageElementWidth;
+        testImage->Height = imageElementHeight;
+        testImage->Stretch = Stretch::Fill;
+    });
+    TestServices::WindowHelper->WaitForIdle();
+
+    // Set the source while still detached - the ordering that used to disable DecodeToRenderSize.
+    RunOnUIThread([&]()
+    {
+        svgImageSource = ref new SvgImageSource();
+        VERIFY_IS_NOT_NULL(svgImageSource);
+
+        auto setSourceAsyncOperation = svgImageSource->SetSourceAsync(svgStream);
+        setSourceAsyncOperation->Completed =
+            ref new wf::AsyncOperationCompletedHandler<SvgImageSourceLoadStatus>(
+                [&status, sourceAsyncCompletionEvent](wf::IAsyncOperation<SvgImageSourceLoadStatus>^ operation, wf::AsyncStatus)
+        {
+            LOG_OUTPUT(L"SetSourceAsync operation completed while detached from the tree");
+            status = operation->GetResults();
+            sourceAsyncCompletionEvent->Set();
+        });
+    });
+
+    // Must complete even with no parent, so this also guards against deferring the decode to a render walk.
+    sourceAsyncCompletionEvent->WaitForDefault();
+    VERIFY_IS_TRUE(sourceAsyncCompletionEvent->HasFired());
+    VERIFY_ARE_EQUAL(status, SvgImageSourceLoadStatus::Success);
+
+    auto svgOpenedEvent = std::make_shared<Event>();
+    auto openedRegistration = CreateSafeEventRegistration(SvgImageSource, Opened);
+
+    // Now put the already-populated source into the live tree.
+    RunOnUIThread([&]()
+    {
+        openedRegistration.Attach(
+            svgImageSource,
+            ref new wf::TypedEventHandler<SvgImageSource^, SvgImageSourceOpenedEventArgs^>([svgOpenedEvent](SvgImageSource^, SvgImageSourceOpenedEventArgs^)
+        {
+            LOG_OUTPUT(L"SvgImageSource Opened event fired");
+            svgOpenedEvent->Set();
+        }));
+
+        testImage->Source = svgImageSource;
+    });
+
+    TestServices::WindowHelper->SynchronouslyTickUIThread(2);
+    TestServices::WindowHelper->WaitForIdle();
+
+    // Entering the live tree re-qualifies DecodeToRenderSize; times out on the unfixed behavior.
+    imageEtwWaiter.WaitForDefault();
+}
+
 } } } } } } }
